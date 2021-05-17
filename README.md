@@ -1,3 +1,38 @@
+# Replace SW-MSA with PixelShuffle
+As sliding window in Swin-Transformer tries to get correlation attention between different window partitions, we intuitively replace sliding window with pixel shuffle, which is also named as Space2Depth and Depth2Space. As pixel shuffle has nothing to do with window shift, the cyclic shift is no-more required, thus may give a natural support for non-square window size. What's more, as pixel shuffle splice image in Space2Depth format, one window in W-MSA is connected to all other windows in SW-MSA(though only one pixel is connected for each window), we argue that this may give a better connection for transformer and may gain counterpart of better accuracy.
+
+The main change is:
+```
+def window_packing(x, window_size):
+    B, H, W, C = x.shape
+    x= x.contiguous().view(B, window_size, H // window_size, window_size, W // window_size, C)
+    windows = x.permute(0, 2, 4, 1, 3, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+```
+
+```
+def window_unpacking(windows, window_size, H, W):
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 3, 1, 4, 2, 5).contiguous().view(B, H, W, -1)
+    return x
+```
+
+
+Due to limited GPU resources, we only conducted an simple experiment with Swin-Tiny for image-classification on ImageNet-1K (which takes about 19 days, 0_0), the result is reported as follows:
+
+| name | pretrain | resolution |acc@1 | acc@5 | #params | FLOPs | FPS| 1K model |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |:---: |
+| Swin-T | ImageNet-1K | 224x224 | 81.4(+0.2) | 95.6(+0.1) | 28M | 4.5G | 755 | [Google Drive](https://drive.google.com/file/d/1qJaK2G01FZy_m9v6eh0-Sn5Eux8u-qUX/view?usp=sharing)|
+
+**If anyone interested in full experiments for complex architecture and other image tasks, you're welcome to download the code and report the result. To run the code, everything is same as Swin-Tranformer.**
+
+## Ref:
+we adopt pixel shuffle code from:
+[PackNet-SFM: https://github.com/TRI-ML/packnet-sfm](https://github.com/TRI-ML/packnet-sfm)
+
+
+
 # Swin Transformer
 
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/swin-transformer-hierarchical-vision/object-detection-on-coco)](https://paperswithcode.com/sota/object-detection-on-coco?p=swin-transformer-hierarchical-vision)

@@ -5,6 +5,12 @@
 # Written by Ze Liu
 # --------------------------------------------------------
 
+# --------------------------------------------------------
+# Date: 05/17/2021
+# Edited By Fang Zhao
+# Replace Sliding window with pixel shuffle
+# --------------------------------------------------------
+
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
@@ -29,6 +35,37 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+def window_packing(x, window_size):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+    
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x= x.contiguous().view(B, window_size, H // window_size, window_size, W // window_size, C)
+    windows = x.permute(0, 2, 4, 1, 3, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+    
+
+def window_unpacking(windows, window_size, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+        
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 3, 1, 4, 2, 5).contiguous().view(B, H, W, -1)
+    return x
+    
 
 def window_partition(x, window_size):
     """
@@ -110,7 +147,7 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
@@ -128,13 +165,7 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
 
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
+        attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
 
@@ -168,7 +199,7 @@ class SwinTransformerBlock(nn.Module):
         input_resolution (tuple[int]): Input resulotion.
         num_heads (int): Number of attention heads.
         window_size (int): Window size.
-        shift_size (int): Shift size for SW-MSA.
+        do_ps (bool): pixel shuffle for SW-MSA.
         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
         qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
         qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
@@ -179,7 +210,7 @@ class SwinTransformerBlock(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
+    def __init__(self, dim, input_resolution, num_heads, window_size=7, do_ps=False,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -187,13 +218,11 @@ class SwinTransformerBlock(nn.Module):
         self.input_resolution = input_resolution
         self.num_heads = num_heads
         self.window_size = window_size
-        self.shift_size = shift_size
+        self.do_ps = do_ps
         self.mlp_ratio = mlp_ratio
         if min(self.input_resolution) <= self.window_size:
             # if window size is larger than input resolution, we don't partition windows
-            self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -205,31 +234,6 @@ class SwinTransformerBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-        if self.shift_size > 0:
-            # calculate attention mask for SW-MSA
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
-
-            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-        else:
-            attn_mask = None
-
-        self.register_buffer("attn_mask", attn_mask)
-
     def forward(self, x):
         H, W = self.input_resolution
         B, L, C = x.shape
@@ -239,28 +243,23 @@ class SwinTransformerBlock(nn.Module):
         x = self.norm1(x)
         x = x.view(B, H, W, C)
 
-        # cyclic shift
-        if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            shifted_x = x
-
         # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        if self.do_ps:
+            x_windows = window_packing(x, self.window_size)
+        else:
+            x_windows = window_partition(x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        attn_windows = self.attn(x_windows)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
-
-        # reverse cyclic shift
-        if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        if self.do_ps:
+            x = window_unpacking(attn_windows, self.window_size, H, W)
         else:
-            x = shifted_x
+            x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+
         x = x.view(B, H * W, C)
 
         # FFN
@@ -371,7 +370,7 @@ class BasicLayer(nn.Module):
         self.blocks = nn.ModuleList([
             SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
                                  num_heads=num_heads, window_size=window_size,
-                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
+                                 do_ps = False if (i % 2 == 0) else True,
                                  mlp_ratio=mlp_ratio,
                                  qkv_bias=qkv_bias, qk_scale=qk_scale,
                                  drop=drop, attn_drop=attn_drop,
